@@ -37,7 +37,9 @@ import {
 const STORAGE_KEYS = {
   PROFILE: "htt:profile",
   PLAN: "htt:plan",
-  LOGS: "htt:logs",
+  LOGS: "htt:logs",                    // resistance workout logs
+  CARDIO_LOGS: "htt:cardioLogs",       // cardio session logs
+  CHECKLIST: "htt:checklist",          // daily checklist by date
   CURRENT_WEEK: "htt:currentWeek",
 };
 
@@ -2125,7 +2127,7 @@ const PLAN_TABS = [
   { key: "principles",   label: "Principles",   icon: Sparkles },
 ];
 
-function PlanScreen({ plan, onOpenWorkout, onEditProfile, onResetAll, logs, currentWeek, onChangeWeek }) {
+function PlanScreen({ plan, onOpenWorkout, onEditProfile, onResetAll, logs, currentWeek, onChangeWeek, cardioLogs, onSaveCardioLog, checklist, onChecklistChange }) {
   const [tab, setTab] = useState("overview");
   const [menuOpen, setMenuOpen] = useState(false);
   const goalLabel = plan.protocol.name;
@@ -2198,9 +2200,9 @@ function PlanScreen({ plan, onOpenWorkout, onEditProfile, onResetAll, logs, curr
       </header>
 
       <main className="flex-1 px-6 md:px-12 py-10 md:py-16 max-w-6xl mx-auto w-full">
-        {tab === "overview"     && <OverviewTab plan={plan} logs={logs} onOpenWorkout={onOpenWorkout} onJumpTab={setTab} phase={phase} currentWeek={currentWeek} />}
+        {tab === "overview"     && <OverviewTab plan={plan} logs={logs} onOpenWorkout={onOpenWorkout} onJumpTab={setTab} phase={phase} currentWeek={currentWeek} checklist={checklist} onChecklistChange={onChecklistChange} />}
         {tab === "workouts"     && <WorkoutsTab plan={plan} logs={logs} onOpenWorkout={onOpenWorkout} phase={phase} currentWeek={currentWeek} onJumpTab={setTab} />}
-        {tab === "cardio"       && <CardioTab plan={plan} />}
+        {tab === "cardio"       && <CardioTab plan={plan} cardioLogs={cardioLogs} onSaveCardioLog={onSaveCardioLog} currentWeek={currentWeek} />}
         {tab === "nutrition"    && <NutritionTab plan={plan} />}
         {tab === "supplements"  && <SupplementsTab plan={plan} />}
         {tab === "progression"  && <ProgressionTab plan={plan} currentWeek={currentWeek} onChangeWeek={onChangeWeek} />}
@@ -2227,7 +2229,7 @@ const menuItemStyle = {
 
 // ── OVERVIEW TAB ──
 
-function OverviewTab({ plan, logs, onOpenWorkout, onJumpTab, phase, currentWeek }) {
+function OverviewTab({ plan, logs, onOpenWorkout, onJumpTab, phase, currentWeek, checklist, onChecklistChange }) {
   const totalSetsPerWeek = plan.resistanceWorkouts.reduce((sum, w) => sum + w.exercises.reduce((s, e) => s + e.sets, 0), 0);
   const cardioMinutes = plan.cardioSessions
     .filter(c => typeof c.instances === "number")
@@ -2238,6 +2240,15 @@ function OverviewTab({ plan, logs, onOpenWorkout, onJumpTab, phase, currentWeek 
       <SectionLabel num={1}>Your Weekly Architecture</SectionLabel>
       <Heading size="lg" className="mb-3">{plan.protocol.name}</Heading>
       <Body muted className="max-w-2xl mb-12">{plan.protocol.blurb}</Body>
+
+      {/* Daily Checklist — most actionable thing to put first */}
+      <div className="mb-12">
+        <DailyChecklist
+          profile={plan.profile}
+          checklist={checklist}
+          onChange={onChecklistChange}
+        />
+      </div>
 
       {/* Phase context for current week */}
       <div className="mb-12">
@@ -2462,10 +2473,14 @@ function ProtocolStat({ label, value, unit }) {
 
 // ── CARDIO TAB ──
 
-function CardioTab({ plan }) {
+function CardioTab({ plan, cardioLogs = [], onSaveCardioLog, currentWeek }) {
   const weekly = plan.cardioSessions.filter(c => typeof c.instances === "number");
   const daily = plan.cardioSessions.filter(c => typeof c.instances !== "number");
   const totalMin = weekly.reduce((s, c) => s + c.duration * c.instances, 0);
+
+  // Count cardio sessions logged this week
+  const completedThisWeek = cardioLogs.filter(l => isThisWeek(l.date)).length;
+  const targetThisWeek = weekly.reduce((s, c) => s + c.instances, 0);
 
   return (
     <div>
@@ -2476,8 +2491,9 @@ function CardioTab({ plan }) {
         is calibrated to your goal — HIIT raises VO₂ max, zone 2 builds the aerobic base, recovery work keeps everything moving.
       </Body>
 
-      <div className="mb-12 grid grid-cols-2 md:grid-cols-3 gap-6 md:gap-12" style={{ borderTop: `1px solid ${COLORS.hairline}`, borderBottom: `1px solid ${COLORS.hairline}`, padding: "32px 0" }}>
-        <StatBlock label="Sessions" value={weekly.reduce((s,c) => s + c.instances, 0)} unit="/wk" accent />
+      <div className="mb-12 grid grid-cols-2 md:grid-cols-4 gap-6 md:gap-12" style={{ borderTop: `1px solid ${COLORS.hairline}`, borderBottom: `1px solid ${COLORS.hairline}`, padding: "32px 0" }}>
+        <StatBlock label="Sessions" value={targetThisWeek} unit="/wk" accent />
+        <StatBlock label="This Week" value={`${completedThisWeek}/${targetThisWeek}`} unit="logged" />
         <StatBlock label="Minutes" value={totalMin} unit="/wk" />
         <StatBlock label="HIIT" value={weekly.filter(c => c.category === "HIIT").reduce((s,c) => s + c.instances, 0)} unit="/wk" />
       </div>
@@ -2486,7 +2502,7 @@ function CardioTab({ plan }) {
       <SectionLabel num={2}>Weekly Sessions</SectionLabel>
       <div className="space-y-4 mb-16">
         {weekly.map((c) => (
-          <CardioCard key={c.id} c={c} />
+          <CardioCard key={c.id} c={c} cardioLogs={cardioLogs} onSaveLog={onSaveCardioLog} currentWeek={currentWeek} />
         ))}
       </div>
 
@@ -2497,7 +2513,7 @@ function CardioTab({ plan }) {
           <Heading size="md" className="mb-3">Exercise snacks & VILPA</Heading>
           <Body muted className="max-w-2xl mb-8">
             Brief vigorous bouts spread across the day — as little as 4 minutes daily reduces cardiovascular and
-            cancer mortality by ~30% in observational data. Layer these on top of your structured sessions.
+            cancer mortality by ~30% in observational data. Track these on the Overview tab's daily checklist.
           </Body>
           <div className="space-y-4 mb-16">
             {daily.map((c) => (
@@ -2544,8 +2560,11 @@ function CardioTab({ plan }) {
   );
 }
 
-function CardioCard({ c }) {
+function CardioCard({ c, cardioLogs = [], onSaveLog, currentWeek }) {
+  const [logging, setLogging] = useState(false);
   const isDaily = typeof c.instances !== "number";
+  const canLog = !!onSaveLog && !isDaily; // daily snacks/VILPA logged via checklist instead
+
   return (
     <Card>
       <div className="p-6">
@@ -2584,7 +2603,25 @@ function CardioCard({ c }) {
               <span><strong style={{ color: COLORS.ink }}>Modes:</strong> {c.equipmentSuggestions.join(", ")}</span>
             )}
           </div>
+          {canLog && <CardioHistoryStrip logs={cardioLogs} sessionId={c.id} />}
         </div>
+
+        {/* Log button + inline form */}
+        {canLog && !logging && (
+          <div className="mt-4">
+            <Button onClick={() => setLogging(true)} variant="ghost" icon={<Check size={14} />}>
+              Log this session
+            </Button>
+          </div>
+        )}
+        {canLog && logging && (
+          <CardioLogForm
+            session={c}
+            week={currentWeek}
+            onSave={(log) => { onSaveLog(log); setLogging(false); }}
+            onCancel={() => setLogging(false)}
+          />
+        )}
       </div>
     </Card>
   );
@@ -3158,6 +3195,358 @@ function setInputStyle(completed) {
 }
 
 /* ============================================================================
+   9b. CARDIO LOGGING + DAILY CHECKLIST
+   ============================================================================ */
+
+// Date helper — returns "YYYY-MM-DD" in user's local timezone, used as checklist key.
+function todayKey(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+// ── Inline cardio logging form (collapses into the cardio card) ──
+
+function CardioLogForm({ session, week, onSave, onCancel }) {
+  const [duration, setDuration] = useState(session.duration || 30);
+  const [intensity, setIntensity] = useState("as prescribed"); // as prescribed | easier | harder
+  const [mode, setMode] = useState(session.equipmentSuggestions?.[0] || "");
+  const [notes, setNotes] = useState("");
+
+  const handleSave = () => {
+    onSave({
+      sessionId: session.id,
+      sessionName: session.name,
+      category: session.category,
+      week,
+      date: new Date().toISOString(),
+      duration,
+      intensity,
+      mode,
+      notes,
+    });
+  };
+
+  return (
+    <div style={{ borderTop: `1px solid ${COLORS.hairline}`, marginTop: 16, paddingTop: 16 }}>
+      <div style={{ ...FONT_TABULAR, fontSize: "10px", color: COLORS.rust, letterSpacing: "0.18em", marginBottom: 12, textTransform: "uppercase", fontWeight: 600 }}>
+        Log this session
+      </div>
+      <div className="grid md:grid-cols-2 gap-4 mb-4">
+        <div>
+          <div style={{ fontSize: "10px", color: COLORS.muted, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>
+            Duration
+          </div>
+          <NumberInput value={duration} onChange={setDuration} min={1} max={300} suffix="min" />
+        </div>
+        <div>
+          <div style={{ fontSize: "10px", color: COLORS.muted, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>
+            Effort
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            {[
+              { id: "easier",          label: "Easier" },
+              { id: "as prescribed",   label: "On target" },
+              { id: "harder",          label: "Harder" },
+            ].map(opt => (
+              <button key={opt.id} onClick={() => setIntensity(opt.id)} type="button"
+                style={{
+                  ...FONT_BODY, padding: "10px 14px",
+                  background: intensity === opt.id ? COLORS.ink : COLORS.card,
+                  color: intensity === opt.id ? COLORS.paper : COLORS.ink,
+                  border: `1px solid ${intensity === opt.id ? COLORS.ink : COLORS.hairline}`,
+                  borderRadius: "3px", cursor: "pointer", fontSize: "13px",
+                }}>
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      {session.equipmentSuggestions && session.equipmentSuggestions.length > 0 && (
+        <div className="mb-4">
+          <div style={{ fontSize: "10px", color: COLORS.muted, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>
+            Mode
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            {session.equipmentSuggestions.map(m => (
+              <button key={m} onClick={() => setMode(m)} type="button"
+                style={{
+                  ...FONT_BODY, padding: "8px 12px",
+                  background: mode === m ? COLORS.ink : COLORS.card,
+                  color: mode === m ? COLORS.paper : COLORS.inkSoft,
+                  border: `1px solid ${mode === m ? COLORS.ink : COLORS.hairline}`,
+                  borderRadius: "3px", cursor: "pointer", fontSize: "12px",
+                }}>
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="mb-4">
+        <div style={{ fontSize: "10px", color: COLORS.muted, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>
+          Notes (optional)
+        </div>
+        <TextInput value={notes} onChange={setNotes} placeholder="Distance, pace, how it felt…" />
+      </div>
+      <div className="flex gap-3">
+        <Button onClick={handleSave} variant="accent" icon={<Check size={14} />}>Save session</Button>
+        <Button onClick={onCancel} variant="quiet">Cancel</Button>
+      </div>
+    </div>
+  );
+}
+
+// ── Cardio history strip (shown when there are recent logs for this session) ──
+
+function CardioHistoryStrip({ logs, sessionId }) {
+  const sessionLogs = logs
+    .filter(l => l.sessionId === sessionId)
+    .sort((a, b) => new Date(b.date) - new Date(a.date))
+    .slice(0, 3);
+  if (sessionLogs.length === 0) return null;
+  return (
+    <div style={{ background: COLORS.paperDeep, padding: "10px 14px", borderRadius: "3px", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+      <ListChecks size={14} style={{ color: COLORS.forest, flexShrink: 0 }} />
+      <span style={{ color: COLORS.muted, fontSize: "10px", letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 }}>Recent:</span>
+      {sessionLogs.map((l, i) => (
+        <span key={i} style={{ ...FONT_TABULAR, color: COLORS.inkSoft, fontSize: "12px" }}>
+          {new Date(l.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · {l.duration}min{l.intensity !== "as prescribed" ? ` (${l.intensity})` : ""}
+          {i < sessionLogs.length - 1 && <span style={{ color: COLORS.hairline, marginLeft: 8 }}>·</span>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// ── Daily checklist ──
+//
+// The checklist surfaces the daily-practice items from the guide.
+// Storage shape: { "YYYY-MM-DD": { snacks: bool, vilpa: bool, hydration: int (cups),
+//                                  protein: bool, sleep: bool, stretch: bool? }, ... }
+//
+// hydrationTarget defaults to 8 cups but bumps up by training load.
+
+function getHydrationTarget(profile) {
+  // Rough rule: ~30 ml/kg/day baseline + 500 ml per training hour. Convert to cups (1 cup = 240 ml).
+  const baselineMl = (profile?.weightKg || 75) * 30;
+  const trainingHours = ((profile?.sessionsPerWeek || 3) * (profile?.minutesPerSession || 60) / 60) / 7;
+  const totalMl = baselineMl + trainingHours * 500;
+  return Math.max(6, Math.round(totalMl / 240));
+}
+
+const CHECKLIST_ITEMS = [
+  {
+    id: "snacks",
+    label: "Exercise snacks",
+    detail: "3–4 brief vigorous bursts (60s or less) spread through the day. Stairs, sprints, fast walk with a bag.",
+    type: "boolean",
+    icon: Zap,
+  },
+  {
+    id: "vilpa",
+    label: "VILPA — vigorous bursts in daily life",
+    detail: "Aim to accumulate 4+ minutes of huffing-and-puffing intensity from regular activity.",
+    type: "boolean",
+    icon: Activity,
+  },
+  {
+    id: "hydration",
+    label: "Hydration",
+    detail: "Cups of water (and other non-caffeinated, non-alcoholic fluids).",
+    type: "counter",
+    icon: Flame,
+  },
+  {
+    id: "protein",
+    label: "Protein target",
+    detail: "Hit your daily total — see Nutrition tab for exact grams.",
+    type: "boolean",
+    icon: Apple,
+  },
+  {
+    id: "sleep",
+    label: "Sleep — 7+ hours last night",
+    detail: "Mechanically when growth and recovery happen. Non-negotiable.",
+    type: "boolean",
+    icon: Moon,
+  },
+];
+
+function DailyChecklist({ profile, checklist, onChange }) {
+  const today = todayKey();
+  const todayState = checklist[today] || {};
+  const hydrationTarget = getHydrationTarget(profile);
+
+  const toggle = (id) => {
+    onChange({ ...checklist, [today]: { ...todayState, [id]: !todayState[id] } });
+  };
+  const incrementCounter = (id, delta) => {
+    const current = todayState[id] || 0;
+    const next = Math.max(0, Math.min(20, current + delta));
+    onChange({ ...checklist, [today]: { ...todayState, [id]: next } });
+  };
+
+  // Count completed items (boolean true OR counter >= target for hydration)
+  const completed = CHECKLIST_ITEMS.reduce((count, item) => {
+    if (item.type === "boolean") return count + (todayState[item.id] ? 1 : 0);
+    if (item.id === "hydration") return count + ((todayState.hydration || 0) >= hydrationTarget ? 1 : 0);
+    return count;
+  }, 0);
+  const total = CHECKLIST_ITEMS.length;
+
+  // Streak: consecutive days where all items were completed
+  const streak = useMemo(() => {
+    let s = 0;
+    for (let i = 0; i < 30; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = todayKey(d);
+      const state = checklist[key];
+      if (!state) break;
+      const allDone = CHECKLIST_ITEMS.every(item => {
+        if (item.type === "boolean") return state[item.id] === true;
+        if (item.id === "hydration") return (state.hydration || 0) >= hydrationTarget;
+        return false;
+      });
+      if (!allDone) break;
+      s++;
+    }
+    return s;
+  }, [checklist, hydrationTarget]);
+
+  return (
+    <Card>
+      <div className="p-6 md:p-7">
+        <div className="flex items-start justify-between gap-4 mb-5 flex-wrap">
+          <div>
+            <div style={{ ...FONT_TABULAR, fontSize: "11px", color: COLORS.rust, letterSpacing: "0.18em", marginBottom: 4, textTransform: "uppercase", fontWeight: 600 }}>
+              Daily Checklist
+            </div>
+            <div style={{ ...FONT_DISPLAY, fontSize: "22px", color: COLORS.ink }}>
+              {new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
+            </div>
+          </div>
+          <div className="flex items-center gap-6">
+            <div className="text-right">
+              <div style={{ fontSize: "10px", color: COLORS.muted, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 }}>Today</div>
+              <div style={{ ...FONT_TABULAR, fontSize: "28px", color: completed === total ? COLORS.forest : COLORS.ink, lineHeight: 1 }}>
+                {completed}<span style={{ fontSize: "16px", color: COLORS.muted }}>/{total}</span>
+              </div>
+            </div>
+            {streak > 0 && (
+              <div className="text-right">
+                <div style={{ fontSize: "10px", color: COLORS.muted, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 }}>Streak</div>
+                <div style={{ ...FONT_TABULAR, fontSize: "28px", color: COLORS.rust, lineHeight: 1 }}>
+                  {streak}<span style={{ fontSize: "16px", color: COLORS.muted, marginLeft: 2 }}>d</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="space-y-2" style={{ borderTop: `1px solid ${COLORS.hairline}`, paddingTop: 16 }}>
+          {CHECKLIST_ITEMS.map(item => (
+            <ChecklistRow
+              key={item.id}
+              item={item}
+              value={todayState[item.id]}
+              hydrationTarget={item.id === "hydration" ? hydrationTarget : null}
+              onToggle={() => toggle(item.id)}
+              onIncrement={(delta) => incrementCounter(item.id, delta)}
+            />
+          ))}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function ChecklistRow({ item, value, hydrationTarget, onToggle, onIncrement }) {
+  const Icon = item.icon;
+
+  if (item.type === "counter") {
+    const current = value || 0;
+    const target = hydrationTarget || 8;
+    const done = current >= target;
+    return (
+      <div style={{
+        padding: "12px 14px",
+        background: done ? COLORS.paperDeep : "transparent",
+        borderRadius: "3px",
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+        transition: "background 180ms ease",
+      }}>
+        <Icon size={16} style={{ color: done ? COLORS.forest : COLORS.muted, flexShrink: 0 }} />
+        <div className="flex-1 min-w-0">
+          <div style={{ ...FONT_BODY, fontSize: "14px", color: COLORS.ink, fontWeight: 500 }}>
+            {item.label}
+          </div>
+          <div style={{ fontSize: "12px", color: COLORS.muted, marginTop: 2 }}>{item.detail}</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => onIncrement(-1)} aria-label="Decrease" style={counterBtn}>
+            <Minus size={12} />
+          </button>
+          <div style={{ ...FONT_TABULAR, fontSize: "16px", color: done ? COLORS.forest : COLORS.ink, minWidth: 50, textAlign: "center" }}>
+            {current}<span style={{ fontSize: "11px", color: COLORS.muted }}>/{target}</span>
+          </div>
+          <button onClick={() => onIncrement(1)} aria-label="Increase" style={counterBtn}>
+            <Plus size={12} />
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Boolean item
+  return (
+    <div onClick={onToggle} style={{
+      padding: "12px 14px",
+      background: value ? COLORS.paperDeep : "transparent",
+      borderRadius: "3px",
+      display: "flex",
+      alignItems: "center",
+      gap: 14,
+      cursor: "pointer",
+      transition: "background 180ms ease",
+    }}>
+      <button
+        onClick={(e) => { e.stopPropagation(); onToggle(); }}
+        aria-label={value ? "Mark incomplete" : "Mark complete"}
+        style={{
+          width: 26, height: 26, borderRadius: "3px", cursor: "pointer",
+          border: `1px solid ${value ? COLORS.forest : COLORS.hairline}`,
+          background: value ? COLORS.forest : COLORS.card,
+          color: value ? "#fff" : "transparent",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          transition: "all 160ms ease", flexShrink: 0,
+        }}
+      >
+        <Check size={14} />
+      </button>
+      <Icon size={16} style={{ color: value ? COLORS.forest : COLORS.muted, flexShrink: 0 }} />
+      <div className="flex-1 min-w-0">
+        <div style={{ ...FONT_BODY, fontSize: "14px", color: COLORS.ink, fontWeight: 500 }}>
+          {item.label}
+        </div>
+        <div style={{ fontSize: "12px", color: COLORS.muted, marginTop: 2 }}>{item.detail}</div>
+      </div>
+    </div>
+  );
+}
+
+const counterBtn = {
+  width: 26, height: 26, borderRadius: "3px", background: COLORS.card,
+  border: `1px solid ${COLORS.hairline}`, cursor: "pointer", color: COLORS.muted,
+  display: "flex", alignItems: "center", justifyContent: "center",
+};
+
+/* ============================================================================
    10. APP ROOT — state machine + storage hydration
    ============================================================================ */
 
@@ -3169,6 +3558,8 @@ export default function HowToTrainApp() {
   const [profile, setProfile] = useState(null);
   const [plan, setPlan] = useState(null);
   const [logs, setLogs] = useState([]);
+  const [cardioLogs, setCardioLogs] = useState([]);
+  const [checklist, setChecklist] = useState({});
   const [currentWeek, setCurrentWeek] = useState(1);
   const [activeWorkoutId, setActiveWorkoutId] = useState(null);
   const [editingProfile, setEditingProfile] = useState(false);
@@ -3176,15 +3567,19 @@ export default function HowToTrainApp() {
   // Hydrate from storage on mount
   useEffect(() => {
     (async () => {
-      const [p, pl, lg, cw] = await Promise.all([
+      const [p, pl, lg, cl, ch, cw] = await Promise.all([
         storage.get(STORAGE_KEYS.PROFILE),
         storage.get(STORAGE_KEYS.PLAN),
         storage.get(STORAGE_KEYS.LOGS),
+        storage.get(STORAGE_KEYS.CARDIO_LOGS),
+        storage.get(STORAGE_KEYS.CHECKLIST),
         storage.get(STORAGE_KEYS.CURRENT_WEEK),
       ]);
       if (p) setProfile(p);
       if (pl) setPlan(pl);
       if (Array.isArray(lg)) setLogs(lg);
+      if (Array.isArray(cl)) setCardioLogs(cl);
+      if (ch && typeof ch === "object") setChecklist(ch);
       if (typeof cw === "number" && cw >= 1) setCurrentWeek(cw);
       if (pl) setScreen("plan");
       setHydrated(true);
@@ -3229,11 +3624,15 @@ export default function HowToTrainApp() {
       storage.remove(STORAGE_KEYS.PROFILE),
       storage.remove(STORAGE_KEYS.PLAN),
       storage.remove(STORAGE_KEYS.LOGS),
+      storage.remove(STORAGE_KEYS.CARDIO_LOGS),
+      storage.remove(STORAGE_KEYS.CHECKLIST),
       storage.remove(STORAGE_KEYS.CURRENT_WEEK),
     ]);
     setProfile(null);
     setPlan(null);
     setLogs([]);
+    setCardioLogs([]);
+    setChecklist({});
     setCurrentWeek(1);
     setActiveWorkoutId(null);
     setScreen("welcome");
@@ -3256,6 +3655,17 @@ export default function HowToTrainApp() {
     setActiveWorkoutId(null);
     setScreen("plan");
   }, [logs]);
+
+  const handleSaveCardioLog = useCallback(async (log) => {
+    const newLogs = [...cardioLogs, log];
+    setCardioLogs(newLogs);
+    await storage.set(STORAGE_KEYS.CARDIO_LOGS, newLogs);
+  }, [cardioLogs]);
+
+  const handleChecklistChange = useCallback(async (newChecklist) => {
+    setChecklist(newChecklist);
+    await storage.set(STORAGE_KEYS.CHECKLIST, newChecklist);
+  }, []);
 
   const handleChangeWeek = useCallback(async (week) => {
     setCurrentWeek(week);
@@ -3293,9 +3703,13 @@ export default function HowToTrainApp() {
         <PlanScreen
           plan={plan}
           logs={logs}
+          cardioLogs={cardioLogs}
+          checklist={checklist}
           currentWeek={currentWeek}
           onChangeWeek={handleChangeWeek}
           onOpenWorkout={handleOpenWorkout}
+          onSaveCardioLog={handleSaveCardioLog}
+          onChecklistChange={handleChecklistChange}
           onEditProfile={handleEditProfile}
           onResetAll={handleResetAll}
         />
