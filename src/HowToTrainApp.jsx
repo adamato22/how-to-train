@@ -27,7 +27,7 @@ import {
   ChevronRight, ChevronLeft, ChevronDown, Check, X, Plus, Minus,
   Settings, RotateCcw, ArrowRight, Info, BookOpen,
   Target, TrendingUp, Apple, Pill, Calendar, Edit2,
-  Trash2, ListChecks, Sparkles, Moon
+  Trash2, ListChecks, Sparkles, Moon, Shuffle
 } from "lucide-react";
 
 /* ============================================================================
@@ -970,6 +970,37 @@ function pickForFocus(focus, equipmentTags, level, used) {
 }
 
 // Determine how many sets & reps to prescribe for a given exercise based on goal & joint type.
+// Find ranked alternative exercises for the given one.
+// Returns the same EXERCISES objects (not the prescription-augmented version).
+// Ranking: same pattern + same joints + level match > same pattern + any joints
+//        > same category + same joints > same category > anything available
+// Always excludes the current exercise and anything in `excludeIds`.
+function findReplacements(currentExercise, equipmentTags, level, excludeIds = []) {
+  const exclude = new Set([currentExercise.id, ...excludeIds]);
+  const baseFilter = (ex) =>
+    !exclude.has(ex.id) &&
+    ex.equipment.every(tag => equipmentTags.includes(tag));
+
+  // Score each candidate by similarity to the current exercise.
+  // Lower score = closer match.
+  const candidates = EXERCISES.filter(baseFilter).map(ex => {
+    let score = 0;
+    if (ex.category !== currentExercise.category) score += 100;
+    if (ex.pattern !== currentExercise.pattern) score += 30;
+    if (ex.joints !== currentExercise.joints) score += 10;
+    // Penalize if no overlap in primary muscles
+    const sharedPrimary = ex.primary.filter(m => currentExercise.primary.includes(m));
+    if (sharedPrimary.length === 0) score += 20;
+    // Slight preference for level match
+    const levelOrder = { beginner: 0, intermediate: 1, advanced: 2 };
+    score += Math.abs((levelOrder[ex.level] ?? 1) - (levelOrder[level] ?? 1)) * 2;
+    return { ex, score };
+  });
+
+  candidates.sort((a, b) => a.score - b.score);
+  return candidates.map(c => c.ex);
+}
+
 function setsRepsForExercise(exercise, protocol, isFirstCompound) {
   const [minSets, maxSets] = protocol.setsPerExercise;
   const [minReps, maxReps] = protocol.repRange;
@@ -2883,6 +2914,19 @@ function WorkoutDetailScreen({ plan, workoutId, logs, currentWeek, onBack, onCom
     );
   }
 
+  const equipmentTags = EQUIPMENT_PRESETS[plan.profile.equipment] || EQUIPMENT_PRESETS["full-gym"];
+
+  // Per-slot exercise overrides. Key: slot index. Value: replacement exercise (with prescription).
+  // Empty by default — falls through to the original workout exercise.
+  const [overrides, setOverrides] = useState({});
+  // Per-slot history of exercise ids we've shown, so successive swaps cycle to new ones.
+  const [swapHistory, setSwapHistory] = useState({});
+
+  // Compute the "effective" exercise list — original with overrides applied.
+  const effectiveExercises = useMemo(() => {
+    return workout.exercises.map((ex, i) => overrides[i] || ex);
+  }, [workout.exercises, overrides]);
+
   // Find last completed log for this workout for showing previous performance.
   const lastLog = useMemo(() => {
     return logs
@@ -2890,28 +2934,133 @@ function WorkoutDetailScreen({ plan, workoutId, logs, currentWeek, onBack, onCom
       .sort((a, b) => new Date(b.date) - new Date(a.date))[0];
   }, [logs, workoutId]);
 
-  // Initialize set state. Each exercise has an array of {reps, weight, completed}.
+  // Set state keyed by slot index (not exercise id) so swapping doesn't require key migration.
+  // Each entry: array of {reps, weight, completed}.
   const [setState, setSetState] = useState(() => {
     const initial = {};
-    for (const ex of workout.exercises) {
-      initial[ex.id] = Array.from({ length: ex.sets }).map(() => ({
+    workout.exercises.forEach((ex, i) => {
+      initial[i] = Array.from({ length: ex.sets }).map(() => ({
         reps: "",
         weight: "",
         completed: false,
       }));
-    }
+    });
     return initial;
   });
 
-  const updateSet = (exId, setIdx, patch) => {
+  // When an effective exercise's set count changes (e.g., swap from compound to isolation),
+  // resize the set state array for that slot, preserving any data the user already entered.
+  useEffect(() => {
+    setSetState(prev => {
+      const next = { ...prev };
+      let changed = false;
+      effectiveExercises.forEach((ex, i) => {
+        const current = prev[i] || [];
+        if (current.length !== ex.sets) {
+          changed = true;
+          if (ex.sets > current.length) {
+            next[i] = [
+              ...current,
+              ...Array.from({ length: ex.sets - current.length }).map(() => ({ reps: "", weight: "", completed: false })),
+            ];
+          } else {
+            next[i] = current.slice(0, ex.sets);
+          }
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [effectiveExercises]);
+
+  const updateSet = (slotIdx, setIdx, patch) => {
     setSetState(prev => ({
       ...prev,
-      [exId]: prev[exId].map((s, i) => i === setIdx ? { ...s, ...patch } : s),
+      [slotIdx]: (prev[slotIdx] || []).map((s, i) => i === setIdx ? { ...s, ...patch } : s),
     }));
   };
 
-  const totalSets = workout.exercises.reduce((s, e) => s + e.sets, 0);
-  const completedSets = Object.values(setState).flat().filter(s => s.completed).length;
+  // Swap an exercise at the given slot for a close alternative.
+  // Cycles through ranked alternatives — pressing repeatedly walks down the list.
+  const handleSwap = (slotIdx) => {
+    const current = effectiveExercises[slotIdx];
+    const original = workout.exercises[slotIdx];
+    const seen = swapHistory[slotIdx] || [original.id, current.id !== original.id ? current.id : null].filter(Boolean);
+
+    const candidates = findReplacements(current, equipmentTags, plan.profile.experience, seen);
+    if (candidates.length === 0) {
+      // We've exhausted all alternatives — reset history and start over (excluding only current).
+      const fresh = findReplacements(current, equipmentTags, plan.profile.experience, [current.id]);
+      if (fresh.length === 0) return; // Truly nothing available
+      const newEx = fresh[0];
+      const isFirstCompound = slotIdx === 0 && newEx.joints === "multi";
+      const sr = setsRepsForExercise(newEx, plan.protocol, isFirstCompound);
+      const enriched = {
+        ...newEx,
+        sets: sr.sets,
+        repRange: sr.repRange,
+        restSec: newEx.joints === "multi" ? plan.protocol.restSec[1] : plan.protocol.restSec[0],
+        loadPctRange: plan.protocol.loadPctRange,
+      };
+      setOverrides(prev => ({ ...prev, [slotIdx]: enriched }));
+      setSwapHistory(prev => ({ ...prev, [slotIdx]: [original.id, newEx.id] }));
+      // Reset sets only if user had completed any
+      const hadCompleted = (setState[slotIdx] || []).some(s => s.completed);
+      if (hadCompleted) {
+        setSetState(prev => ({
+          ...prev,
+          [slotIdx]: Array.from({ length: enriched.sets }).map(() => ({ reps: "", weight: "", completed: false })),
+        }));
+      }
+      return;
+    }
+
+    const newEx = candidates[0];
+    const isFirstCompound = slotIdx === 0 && newEx.joints === "multi";
+    const sr = setsRepsForExercise(newEx, plan.protocol, isFirstCompound);
+    const enriched = {
+      ...newEx,
+      sets: sr.sets,
+      repRange: sr.repRange,
+      restSec: newEx.joints === "multi" ? plan.protocol.restSec[1] : plan.protocol.restSec[0],
+      loadPctRange: plan.protocol.loadPctRange,
+    };
+
+    setOverrides(prev => ({ ...prev, [slotIdx]: enriched }));
+    setSwapHistory(prev => ({ ...prev, [slotIdx]: [...seen, newEx.id] }));
+    // Reset sets only if user had completed any
+    const hadCompleted = (setState[slotIdx] || []).some(s => s.completed);
+    if (hadCompleted) {
+      setSetState(prev => ({
+        ...prev,
+        [slotIdx]: Array.from({ length: enriched.sets }).map(() => ({ reps: "", weight: "", completed: false })),
+      }));
+    }
+  };
+
+  // Restore the original exercise at a slot.
+  const handleRevert = (slotIdx) => {
+    setOverrides(prev => {
+      const next = { ...prev };
+      delete next[slotIdx];
+      return next;
+    });
+    setSwapHistory(prev => {
+      const next = { ...prev };
+      delete next[slotIdx];
+      return next;
+    });
+    const hadCompleted = (setState[slotIdx] || []).some(s => s.completed);
+    if (hadCompleted) {
+      const originalSets = workout.exercises[slotIdx].sets;
+      setSetState(prev => ({
+        ...prev,
+        [slotIdx]: Array.from({ length: originalSets }).map(() => ({ reps: "", weight: "", completed: false })),
+      }));
+    }
+  };
+
+  const totalSets = effectiveExercises.reduce((s, e) => s + e.sets, 0);
+  const completedSets = Object.values(setState).flat().filter(s => s && s.completed).length;
   const progress = totalSets === 0 ? 0 : Math.round((completedSets / totalSets) * 100);
 
   const handleComplete = () => {
@@ -2921,11 +3070,13 @@ function WorkoutDetailScreen({ plan, workoutId, logs, currentWeek, onBack, onCom
       week: currentWeek,
       date: new Date().toISOString(),
       completed: true,
-      exercises: workout.exercises.map(ex => ({
+      exercises: effectiveExercises.map((ex, i) => ({
         exerciseId: ex.id,
         exerciseName: ex.name,
+        wasSubstituted: !!overrides[i],
+        originalExerciseId: overrides[i] ? workout.exercises[i].id : null,
         prescribed: { sets: ex.sets, repRange: ex.repRange },
-        sets: setState[ex.id],
+        sets: setState[i] || [],
       })),
     };
     onComplete(log);
@@ -3002,17 +3153,25 @@ function WorkoutDetailScreen({ plan, workoutId, logs, currentWeek, onBack, onCom
 
         {/* Exercises */}
         <div className="space-y-6">
-          {workout.exercises.map((ex, exIdx) => {
+          {effectiveExercises.map((ex, exIdx) => {
+            const isSubstituted = !!overrides[exIdx];
+            const originalEx = workout.exercises[exIdx];
+            // Last performance lookup matches by exercise id; if substituted, show last data for the
+            // current (substituted) exercise — that's more useful than the original's history.
             const lastEx = lastLog?.exercises?.find(e => e.exerciseId === ex.id);
             return (
               <ExerciseLogCard
-                key={ex.id}
+                key={`${exIdx}-${ex.id}`}
                 exercise={ex}
                 index={exIdx}
-                sets={setState[ex.id]}
-                onUpdateSet={(setIdx, patch) => updateSet(ex.id, setIdx, patch)}
+                sets={setState[exIdx] || []}
+                onUpdateSet={(setIdx, patch) => updateSet(exIdx, setIdx, patch)}
                 lastPerformance={lastEx}
                 weightUnit={plan.profile.weightUnit}
+                onSwap={() => handleSwap(exIdx)}
+                onRevert={isSubstituted ? () => handleRevert(exIdx) : null}
+                isSubstituted={isSubstituted}
+                originalName={isSubstituted ? originalEx.name : null}
               />
             );
           })}
@@ -3041,7 +3200,7 @@ function WorkoutDetailScreen({ plan, workoutId, logs, currentWeek, onBack, onCom
   );
 }
 
-function ExerciseLogCard({ exercise, index, sets, onUpdateSet, lastPerformance, weightUnit }) {
+function ExerciseLogCard({ exercise, index, sets, onUpdateSet, lastPerformance, weightUnit, onSwap, onRevert, isSubstituted, originalName }) {
   const [expanded, setExpanded] = useState(true);
   const ex = exercise;
 
@@ -3057,13 +3216,21 @@ function ExerciseLogCard({ exercise, index, sets, onUpdateSet, lastPerformance, 
     <Card>
       <div className="p-5 md:p-6">
         {/* Header row */}
-        <div className="flex items-start justify-between gap-4 cursor-pointer" onClick={() => setExpanded(!expanded)}>
-          <div className="flex gap-4 flex-1">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex gap-4 flex-1 cursor-pointer min-w-0" onClick={() => setExpanded(!expanded)}>
             <div style={{ ...FONT_TABULAR, fontSize: "30px", color: COLORS.rust, fontWeight: 300, lineHeight: 1, minWidth: 40 }}>
               {String(index+1).padStart(2,"0")}
             </div>
-            <div className="flex-1">
-              <div style={{ ...FONT_DISPLAY, fontSize: "22px", color: COLORS.ink, letterSpacing: "-0.01em", marginBottom: 4 }}>{ex.name}</div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-3 flex-wrap mb-1">
+                <div style={{ ...FONT_DISPLAY, fontSize: "22px", color: COLORS.ink, letterSpacing: "-0.01em" }}>{ex.name}</div>
+                {isSubstituted && <Badge color={COLORS.forest}>Swapped</Badge>}
+              </div>
+              {isSubstituted && originalName && (
+                <div style={{ fontSize: "11px", color: COLORS.muted, marginBottom: 6 }}>
+                  Originally <span style={{ textDecoration: "line-through" }}>{originalName}</span>
+                </div>
+              )}
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm" style={{ color: COLORS.muted }}>
                 <span><strong style={{ color: COLORS.ink, ...FONT_TABULAR }}>{ex.sets}</strong> sets</span>
                 <span>×</span>
@@ -3075,7 +3242,67 @@ function ExerciseLogCard({ exercise, index, sets, onUpdateSet, lastPerformance, 
               </div>
             </div>
           </div>
-          <ChevronDown size={18} style={{ color: COLORS.muted, transition: "transform 200ms", transform: expanded ? "rotate(180deg)" : "rotate(0)" }} />
+          <div className="flex items-center gap-1 flex-shrink-0">
+            {/* Swap button */}
+            {onSwap && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onSwap(); }}
+                title="Swap for a similar exercise"
+                aria-label="Swap exercise"
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${COLORS.hairline}`,
+                  borderRadius: "3px",
+                  padding: "8px 10px",
+                  cursor: "pointer",
+                  color: COLORS.muted,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: "11px",
+                  letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  fontWeight: 600,
+                  transition: "all 160ms ease",
+                  ...FONT_BODY,
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.borderColor = COLORS.ink; e.currentTarget.style.color = COLORS.ink; }}
+                onMouseLeave={(e) => { e.currentTarget.style.borderColor = COLORS.hairline; e.currentTarget.style.color = COLORS.muted; }}
+              >
+                <Shuffle size={13} />
+                <span className="hidden md:inline">Swap</span>
+              </button>
+            )}
+            {onRevert && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onRevert(); }}
+                title="Revert to original exercise"
+                aria-label="Revert to original"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  borderRadius: "3px",
+                  padding: "8px",
+                  cursor: "pointer",
+                  color: COLORS.muted,
+                  display: "flex",
+                  alignItems: "center",
+                  transition: "color 160ms ease",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = COLORS.ink; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = COLORS.muted; }}
+              >
+                <RotateCcw size={14} />
+              </button>
+            )}
+            <button
+              onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+              aria-label={expanded ? "Collapse" : "Expand"}
+              style={{ background: "transparent", border: "none", cursor: "pointer", padding: 8, color: COLORS.muted, display: "flex" }}
+            >
+              <ChevronDown size={18} style={{ transition: "transform 200ms", transform: expanded ? "rotate(180deg)" : "rotate(0)" }} />
+            </button>
+          </div>
         </div>
 
         {expanded && (
@@ -3341,15 +3568,19 @@ const CHECKLIST_ITEMS = [
   {
     id: "snacks",
     label: "Exercise snacks",
-    detail: "3–4 brief vigorous bursts (60s or less) spread through the day. Stairs, sprints, fast walk with a bag.",
-    type: "boolean",
+    detail: "Brief vigorous bursts (60s or less) spread through the day. Tap each as you do one — aim for 3 of 4.",
+    type: "multi-check",
+    target: 3,           // considered "complete" once this many are checked
+    slots: 4,            // total dots shown
     icon: Zap,
   },
   {
     id: "vilpa",
     label: "VILPA — vigorous bursts in daily life",
-    detail: "Aim to accumulate 4+ minutes of huffing-and-puffing intensity from regular activity.",
-    type: "boolean",
+    detail: "Stairs, brisk walks with a bag, sprinting for the bus. Tap each as you accumulate one. Target: 3 of 4.",
+    type: "multi-check",
+    target: 3,
+    slots: 4,
     icon: Activity,
   },
   {
@@ -3380,6 +3611,19 @@ function DailyChecklist({ profile, checklist, onChange }) {
   const todayState = checklist[today] || {};
   const hydrationTarget = getHydrationTarget(profile);
 
+  // Helper: is a given item "complete" today?
+  const isItemComplete = (item, state, hydrTarget) => {
+    if (item.type === "boolean") return state[item.id] === true;
+    if (item.type === "counter") {
+      const target = item.id === "hydration" ? hydrTarget : (item.target || 1);
+      return (state[item.id] || 0) >= target;
+    }
+    if (item.type === "multi-check") {
+      return (state[item.id] || 0) >= (item.target || 1);
+    }
+    return false;
+  };
+
   const toggle = (id) => {
     onChange({ ...checklist, [today]: { ...todayState, [id]: !todayState[id] } });
   };
@@ -3388,13 +3632,16 @@ function DailyChecklist({ profile, checklist, onChange }) {
     const next = Math.max(0, Math.min(20, current + delta));
     onChange({ ...checklist, [today]: { ...todayState, [id]: next } });
   };
+  // Multi-check: tapping a slot toggles up to that index. So tapping slot 2 sets count to 3
+  // if it was below 3, or back to 2 if it was already at 3+.
+  const tapMultiSlot = (id, slotIdx, slots) => {
+    const current = todayState[id] || 0;
+    const targetCount = slotIdx + 1;
+    const next = current >= targetCount ? slotIdx : targetCount;
+    onChange({ ...checklist, [today]: { ...todayState, [id]: Math.max(0, Math.min(slots, next)) } });
+  };
 
-  // Count completed items (boolean true OR counter >= target for hydration)
-  const completed = CHECKLIST_ITEMS.reduce((count, item) => {
-    if (item.type === "boolean") return count + (todayState[item.id] ? 1 : 0);
-    if (item.id === "hydration") return count + ((todayState.hydration || 0) >= hydrationTarget ? 1 : 0);
-    return count;
-  }, 0);
+  const completed = CHECKLIST_ITEMS.reduce((count, item) => count + (isItemComplete(item, todayState, hydrationTarget) ? 1 : 0), 0);
   const total = CHECKLIST_ITEMS.length;
 
   // Streak: consecutive days where all items were completed
@@ -3406,11 +3653,7 @@ function DailyChecklist({ profile, checklist, onChange }) {
       const key = todayKey(d);
       const state = checklist[key];
       if (!state) break;
-      const allDone = CHECKLIST_ITEMS.every(item => {
-        if (item.type === "boolean") return state[item.id] === true;
-        if (item.id === "hydration") return (state.hydration || 0) >= hydrationTarget;
-        return false;
-      });
+      const allDone = CHECKLIST_ITEMS.every(item => isItemComplete(item, state, hydrationTarget));
       if (!allDone) break;
       s++;
     }
@@ -3454,8 +3697,10 @@ function DailyChecklist({ profile, checklist, onChange }) {
               item={item}
               value={todayState[item.id]}
               hydrationTarget={item.id === "hydration" ? hydrationTarget : null}
+              isComplete={isItemComplete(item, todayState, hydrationTarget)}
               onToggle={() => toggle(item.id)}
               onIncrement={(delta) => incrementCounter(item.id, delta)}
+              onTapMultiSlot={(slotIdx) => tapMultiSlot(item.id, slotIdx, item.slots)}
             />
           ))}
         </div>
@@ -3464,13 +3709,71 @@ function DailyChecklist({ profile, checklist, onChange }) {
   );
 }
 
-function ChecklistRow({ item, value, hydrationTarget, onToggle, onIncrement }) {
+function ChecklistRow({ item, value, hydrationTarget, isComplete, onToggle, onIncrement, onTapMultiSlot }) {
   const Icon = item.icon;
+  const done = !!isComplete;
+
+  if (item.type === "multi-check") {
+    const current = value || 0;
+    const slots = item.slots || 4;
+    return (
+      <div style={{
+        padding: "12px 14px",
+        background: done ? COLORS.paperDeep : "transparent",
+        borderRadius: "3px",
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+        transition: "background 180ms ease",
+      }}>
+        <Icon size={16} style={{ color: done ? COLORS.forest : COLORS.muted, flexShrink: 0 }} />
+        <div className="flex-1 min-w-0">
+          <div style={{ ...FONT_BODY, fontSize: "14px", color: COLORS.ink, fontWeight: 500 }}>
+            {item.label}
+          </div>
+          <div style={{ fontSize: "12px", color: COLORS.muted, marginTop: 2 }}>{item.detail}</div>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <div className="flex gap-1.5" style={{ display: "flex", gap: 6 }}>
+            {Array.from({ length: slots }).map((_, i) => {
+              const filled = i < current;
+              return (
+                <button
+                  key={i}
+                  onClick={() => onTapMultiSlot(i)}
+                  aria-label={`Mark burst ${i + 1}`}
+                  style={{
+                    width: 26, height: 26, borderRadius: "50%", cursor: "pointer",
+                    border: `1.5px solid ${filled ? COLORS.forest : COLORS.hairline}`,
+                    background: filled ? COLORS.forest : COLORS.card,
+                    color: filled ? "#fff" : "transparent",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    transition: "all 160ms ease",
+                    padding: 0,
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!filled) e.currentTarget.style.borderColor = COLORS.ink;
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!filled) e.currentTarget.style.borderColor = COLORS.hairline;
+                  }}
+                >
+                  <Check size={12} />
+                </button>
+              );
+            })}
+          </div>
+          <span style={{ ...FONT_TABULAR, fontSize: "12px", color: done ? COLORS.forest : COLORS.muted, minWidth: 28, textAlign: "right" }}>
+            {current}/{slots}
+          </span>
+        </div>
+      </div>
+    );
+  }
 
   if (item.type === "counter") {
     const current = value || 0;
     const target = hydrationTarget || 8;
-    const done = current >= target;
     return (
       <div style={{
         padding: "12px 14px",
@@ -3507,7 +3810,7 @@ function ChecklistRow({ item, value, hydrationTarget, onToggle, onIncrement }) {
   return (
     <div onClick={onToggle} style={{
       padding: "12px 14px",
-      background: value ? COLORS.paperDeep : "transparent",
+      background: done ? COLORS.paperDeep : "transparent",
       borderRadius: "3px",
       display: "flex",
       alignItems: "center",
@@ -3517,19 +3820,19 @@ function ChecklistRow({ item, value, hydrationTarget, onToggle, onIncrement }) {
     }}>
       <button
         onClick={(e) => { e.stopPropagation(); onToggle(); }}
-        aria-label={value ? "Mark incomplete" : "Mark complete"}
+        aria-label={done ? "Mark incomplete" : "Mark complete"}
         style={{
           width: 26, height: 26, borderRadius: "3px", cursor: "pointer",
-          border: `1px solid ${value ? COLORS.forest : COLORS.hairline}`,
-          background: value ? COLORS.forest : COLORS.card,
-          color: value ? "#fff" : "transparent",
+          border: `1px solid ${done ? COLORS.forest : COLORS.hairline}`,
+          background: done ? COLORS.forest : COLORS.card,
+          color: done ? "#fff" : "transparent",
           display: "flex", alignItems: "center", justifyContent: "center",
           transition: "all 160ms ease", flexShrink: 0,
         }}
       >
         <Check size={14} />
       </button>
-      <Icon size={16} style={{ color: value ? COLORS.forest : COLORS.muted, flexShrink: 0 }} />
+      <Icon size={16} style={{ color: done ? COLORS.forest : COLORS.muted, flexShrink: 0 }} />
       <div className="flex-1 min-w-0">
         <div style={{ ...FONT_BODY, fontSize: "14px", color: COLORS.ink, fontWeight: 500 }}>
           {item.label}
